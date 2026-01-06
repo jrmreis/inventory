@@ -56,7 +56,9 @@ IMPORTANT CONTEXT:
 - Look for ANY recognizable patterns: part numbers, values, manufacturer codes, component type keywords
 - Common boards: Arduino (Uno, Mega, Nano), ESP32, ESP8266, Raspberry Pi
 - Arduino boards often have "Arduino", "ATmega", or "Made in Italy" text visible
-- Development boards are usually blue PCBs with lots of pins and USB connectors
+- Development boards are usually blue/green PCBs with lots of pins and USB connectors
+- Consumer electronics (earbuds, headphones, gadgets) are NOT electronic components - mark them as "other" or "accessory"
+- If you see brand names like "HAYLOU", "Sony", "JBL", "Anker" without circuit board, it's likely an accessory, not a component
 
 OCR Text:
 {ocr_text}

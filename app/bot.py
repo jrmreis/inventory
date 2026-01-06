@@ -423,10 +423,42 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # If we don't have extracted_data from color detection, try OCR + AI
         if not extracted_data:
-            if not ocr_text or len(ocr_text) < 3:
-                logger.warning(f"Insufficient OCR text: '{ocr_text}'")
+            # First try: OCR + Groq AI
+            if ocr_text and len(ocr_text) >= 3:
+                logger.info(f"Sending OCR to Groq AI: '{ocr_text[:100]}...'")
+                extracted_data = data_ext.extract_component_data(
+                    ocr_text,
+                    photo_path
+                )
+
+            # If OCR failed or gave low confidence, try Vision AI
+            if not extracted_data or extracted_data.get('recognition_confidence', 0) < 25:
+                logger.info("OCR failed or low confidence, trying Vision AI...")
+
+                # Try to use vision recognition
+                try:
+                    from .vision_recognition import VisionRecognizer
+                    vision = VisionRecognizer()
+
+                    if vision.is_available():
+                        logger.info("Using Vision AI for recognition...")
+                        vision_result = vision.recognize_component(photo_path)
+
+                        if vision_result and vision_result.get('recognition_confidence', 0) > 40:
+                            extracted_data = vision_result
+                            logger.info(f"✅ Vision AI succeeded: {vision_result.get('component_type')} with {vision_result.get('recognition_confidence')}% confidence")
+                        else:
+                            logger.warning("Vision AI gave low confidence result")
+                    else:
+                        logger.info("Vision AI not configured (OPENAI_API_KEY not set)")
+                except Exception as e:
+                    logger.warning(f"Vision AI failed: {e}")
+
+            # If still no good data, show error
+            if not extracted_data or extracted_data.get('recognition_confidence', 0) < 20:
+                logger.warning(f"All recognition methods failed. OCR: {len(ocr_text)} chars")
                 await update.message.reply_text(
-                    "⚠️ Could not extract readable text from the image.\n\n"
+                    "⚠️ Could not identify this component.\n\n"
                     "Please try:\n"
                     "• Better lighting (natural light works best)\n"
                     "• Clearer focus on any text/markings\n"
@@ -435,13 +467,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     "💡 Or use /add to enter the component manually."
                 )
                 return
-
-            # Extract component data using AI
-            logger.info(f"Sending to AI: '{ocr_text[:100]}...'")
-            extracted_data = data_ext.extract_component_data(
-                ocr_text,
-                photo_path
-            )
 
         # Check if we got useful data (confidence > 20% and valid type)
         confidence = extracted_data.get('recognition_confidence', 0) if extracted_data else 0
@@ -470,23 +495,44 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data['component']['last_modified_by'] = update.effective_user.id
 
         # Show extracted data for confirmation
-        specs_str = str(extracted_data.get('specifications', {}))
-        if specs_str == '{}':
+        specs = extracted_data.get('specifications', {})
+        if specs:
+            # Format specs as readable text, avoiding special markdown characters
+            specs_list = [f"{k}: {v}" for k, v in specs.items()]
+            specs_str = ', '.join(specs_list) if specs_list else 'None detected'
+        else:
             specs_str = 'None detected'
 
-        summary = f"""
-🤖 *AI-Detected Component:*
+        # Escape special markdown characters to avoid parsing errors
+        def escape_markdown(text):
+            """Escape markdown special characters."""
+            if text is None:
+                return 'N/A'
+            text = str(text)
+            # Escape: _ * [ ] ( ) ~ ` > # + - = | { } . !
+            special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+            for char in special_chars:
+                text = text.replace(char, f'\\{char}')
+            return text
 
-*Type:* {extracted_data.get('component_type', 'Unknown')}
-*Name:* {extracted_data.get('name', 'Unknown')}
-*Part Number:* {extracted_data.get('part_number', 'N/A')}
+        comp_type = escape_markdown(extracted_data.get('component_type', 'Unknown'))
+        comp_name = escape_markdown(extracted_data.get('name', 'Unknown'))
+        part_num = escape_markdown(extracted_data.get('part_number', 'None'))
+        specs_str = escape_markdown(specs_str)
+
+        summary = f"""
+🤖 *AI\\-Detected Component:*
+
+*Type:* {comp_type}
+*Name:* {comp_name}
+*Part Number:* {part_num}
 *Specs:* {specs_str}
 *Confidence:* {confidence}%
 
 Please enter the quantity you have, or type 'skip' to cancel:
 """
 
-        await update.message.reply_text(summary, parse_mode='Markdown')
+        await update.message.reply_text(summary, parse_mode='MarkdownV2')
         context.user_data['awaiting_quantity_for_photo'] = True
 
         # Clean up temp file
@@ -526,6 +572,11 @@ async def handle_photo_quantity(update: Update, context: ContextTypes.DEFAULT_TY
         # Get component data from context
         component = context.user_data.get('component', {})
         component['quantity'] = quantity
+
+        # Remove fields that don't exist in database schema
+        # Vision AI adds these extra fields that we don't have columns for
+        component.pop('recognition_method', None)
+        component.pop('visual_features', None)
 
         # Save to database
         db = get_supabase()
@@ -607,6 +658,92 @@ async def search_components(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception as e:
         logger.error(f"Search error: {e}")
         await update.message.reply_text(f"❌ Search failed: {str(e)}")
+
+
+async def view_component(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View detailed information about a component by ID."""
+    if not is_authorized(update.effective_user):
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+
+    try:
+        # Extract component ID from command
+        if not context.args or len(context.args) == 0:
+            await update.message.reply_text(
+                "❌ Please provide a component ID.\n\n"
+                "Usage: /view <ID>\n"
+                "Example: /view 5"
+            )
+            return
+
+        component_id = int(context.args[0])
+
+        db = get_supabase()
+        result = db.table('components').select('*').eq('id', component_id).execute()
+
+        if not result.data or len(result.data) == 0:
+            await update.message.reply_text(f"❌ Component with ID {component_id} not found.")
+            return
+
+        comp = result.data[0]
+
+        # Format specifications
+        specs = comp.get('specifications', {})
+        if specs and isinstance(specs, dict):
+            specs_str = '\n'.join([f"  • {k}: {v}" for k, v in specs.items()])
+        else:
+            specs_str = "  None"
+
+        # Format tags
+        tags = comp.get('tags', [])
+        tags_str = ', '.join(tags) if tags else 'None'
+
+        # Build response
+        response = f"""
+📦 *Component Details*
+
+*ID:* {comp['id']}
+*Type:* {comp.get('component_type', 'N/A')}
+*Name:* {comp.get('name', 'N/A')}
+
+*Manufacturer:* {comp.get('manufacturer') or 'N/A'}
+*Part Number:* {comp.get('part_number') or 'N/A'}
+
+*Specifications:*
+{specs_str}
+
+*Inventory:*
+  • Quantity: {comp.get('quantity', 0)}
+  • Min Quantity: {comp.get('minimum_quantity', 0)}
+  • Location: {comp.get('storage_location') or 'Not specified'}
+
+*Tags:* {tags_str}
+
+*Description:*
+{comp.get('description') or 'No description'}
+
+*Notes:*
+{comp.get('notes') or 'No notes'}
+
+*Recognition:*
+  • Confidence: {comp.get('recognition_confidence') or 'N/A'}%
+  • OCR Text: {comp.get('ocr_text')[:50] + '...' if comp.get('ocr_text') else 'N/A'}
+
+*Created:* {comp.get('created_at', 'N/A')[:10]}
+*Updated:* {comp.get('updated_at', 'N/A')[:10]}
+"""
+
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid component ID. Please provide a number.\n\n"
+            "Usage: /view <ID>\n"
+            "Example: /view 5"
+        )
+    except Exception as e:
+        logger.error(f"View component error: {e}")
+        await update.message.reply_text(f"❌ Error viewing component: {str(e)}")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -720,6 +857,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("myid", myid_command))
+    application.add_handler(CommandHandler("view", view_component))
     application.add_handler(CommandHandler("search", search_components))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("low_stock", low_stock_command))

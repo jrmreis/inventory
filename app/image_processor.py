@@ -35,7 +35,7 @@ class ImageProcessor:
 
         Args:
             image_path: Path to image file
-            strategy: Preprocessing strategy ('minimal', 'balanced', 'aggressive')
+            strategy: Preprocessing strategy ('minimal', 'balanced', 'aggressive', 'inverted')
 
         Returns:
             Processed image as numpy array
@@ -48,6 +48,10 @@ class ImageProcessor:
 
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Check if image is predominantly dark (might need inversion)
+        mean_brightness = cv2.mean(gray)[0]
+        is_dark_image = mean_brightness < 100  # Dark if mean brightness < 100
 
         if strategy == "minimal":
             # Just resize if needed
@@ -92,6 +96,26 @@ class ImageProcessor:
                 scale = 1200 / denoised.shape[0]
                 width = int(denoised.shape[1] * scale)
                 denoised = cv2.resize(denoised, (width, 1200), interpolation=cv2.INTER_CUBIC)
+
+            return denoised
+
+        elif strategy == "inverted":
+            # For dark objects with light text (like black earbuds with white text)
+            # Resize first
+            if gray.shape[0] < 1200:
+                scale = 1500 / gray.shape[0]
+                width = int(gray.shape[1] * scale)
+                gray = cv2.resize(gray, (width, 1500), interpolation=cv2.INTER_CUBIC)
+
+            # Invert the image (black becomes white, white becomes black)
+            inverted = cv2.bitwise_not(gray)
+
+            # Enhance contrast
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(inverted)
+
+            # Denoise
+            denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
 
             return denoised
 
@@ -223,8 +247,31 @@ class ImageProcessor:
             'text': '',
             'confidence': 0,
             'strategy_used': '',
-            'colors': None
+            'colors': None,
+            'is_dark_image': False
         }
+
+        # Check if image is dark (for strategy selection)
+        img = cv2.imread(image_path)
+        if img is not None:
+            gray_check = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # Calculate both mean and median brightness
+            mean_brightness = cv2.mean(gray_check)[0]
+
+            # Use histogram to find dominant brightness range (object vs background)
+            hist = cv2.calcHist([gray_check], [0], None, [256], [0, 256])
+            # Find the peak in the darker half (0-127) vs lighter half (128-255)
+            dark_pixels = float(np.sum(hist[0:128]))
+            light_pixels = float(np.sum(hist[128:256]))
+
+            # If more than 30% of pixels are dark, consider it a dark image
+            total_pixels = dark_pixels + light_pixels
+            dark_ratio = dark_pixels / total_pixels if total_pixels > 0 else 0
+
+            # Mark as dark if: mean < 100 OR dark_ratio > 0.3
+            results['is_dark_image'] = mean_brightness < 100 or dark_ratio > 0.3
+            logger.info(f"Image brightness: {mean_brightness:.1f}, dark_ratio: {dark_ratio:.2f}, is_dark: {results['is_dark_image']}")
 
         # Try color detection FIRST (for resistors, diodes, etc.)
         if detect_colors:
@@ -238,7 +285,12 @@ class ImageProcessor:
                 logger.warning(f"Color detection failed: {e}")
 
         # Try different preprocessing strategies for OCR
-        strategies = ['balanced', 'minimal', 'aggressive']
+        # If image is dark, prioritize inverted strategy
+        if results.get('is_dark_image'):
+            strategies = ['inverted', 'balanced', 'aggressive', 'minimal']
+            logger.info("Dark image detected - trying inverted strategy first")
+        else:
+            strategies = ['balanced', 'minimal', 'aggressive']
 
         for strategy in strategies:
             try:

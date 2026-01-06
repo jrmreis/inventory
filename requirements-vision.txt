@@ -1,0 +1,12 @@
+# Optional Vision Recognition Dependencies
+# Install with: pip install -r requirements-vision.txt
+
+# OpenAI GPT-4 Vision (Recommended - Best accuracy)
+openai>=1.0.0
+
+# Google Cloud Vision (Alternative)
+google-cloud-vision>=3.4.0
+
+# Choose one based on your preference:
+# - OpenAI: Better for component identification, easier to use
+# - Google: Better for general object detection, includes web search
