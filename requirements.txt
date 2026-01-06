@@ -1,0 +1,24 @@
+# Telegram Bot
+python-telegram-bot==21.9
+
+# Database
+supabase==2.9.0
+
+# WebSockets (required for realtime features)
+websockets>=13.0
+
+# Image Processing
+opencv-python-headless>=4.9.0
+Pillow>=10.4.0
+pytesseract>=0.3.10
+numpy>=1.26.0,<2.0  # OpenCV requires numpy 1.x
+
+# AI Integration
+groq>=0.11.0
+
+# Utilities
+python-dotenv>=1.0.0
+python-dateutil>=2.8.0
+
+# HTTP
+httpx>=0.27.0

@@ -1,0 +1,147 @@
+name: Deploy Inventory Bot
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: inventory-bot-production
+  ECS_CLUSTER: inventory-bot-production
+  ECS_SERVICE: inventory-bot-production
+  CONTAINER_NAME: inventory-bot
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read    # Required for checkout
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Python syntax
+        run: |
+          python3 -m py_compile main.py
+          python3 -m py_compile app/*.py
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          # Push to ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update secrets in AWS Secrets Manager
+        env:
+          SECRET_NAME: inventory-bot-production-secrets
+        run: |
+          # Update secrets from GitHub secrets
+          aws secretsmanager update-secret \
+            --secret-id $SECRET_NAME \
+            --secret-string "{
+              \"TELEGRAM_BOT_TOKEN\": \"${{ secrets.TELEGRAM_BOT_TOKEN }}\",
+              \"SUPABASE_URL\": \"${{ secrets.SUPABASE_URL }}\",
+              \"SUPABASE_KEY\": \"${{ secrets.SUPABASE_KEY }}\",
+              \"GROQ_API_KEY\": \"${{ secrets.GROQ_API_KEY }}\",
+              \"ALLOWED_USER_IDS\": \"${{ secrets.ALLOWED_USER_IDS }}\"
+            }" || echo "Secrets update skipped (may not exist yet)"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition inventory-bot-production \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        run: |
+          # Wait a bit for the service to stabilize
+          sleep 30
+
+          # Check service status
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].runningCount' \
+            --output text)
+
+          echo "Running tasks: $SERVICE_STATUS"
+
+          if [ "$SERVICE_STATUS" -lt 1 ]; then
+            echo "❌ Deployment failed: No running tasks"
+            exit 1
+          fi
+
+          # Check for errors in logs (last 5 minutes)
+          LOG_GROUP="/ecs/inventory-bot-production"
+          ERROR_COUNT=$(aws logs filter-log-events \
+            --log-group-name $LOG_GROUP \
+            --start-time $(($(date +%s) - 300))000 \
+            --filter-pattern "ERROR" \
+            --query 'events | length(@)' \
+            --output text || echo "0")
+
+          echo "Recent errors: $ERROR_COUNT"
+
+          if [ "$ERROR_COUNT" -gt 10 ]; then
+            echo "⚠️  Warning: High error count detected in logs"
+          fi
+
+          echo "✅ Deployment successful!"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed!"
+          echo "Check the logs at: https://console.aws.amazon.com/ecs/"
+          exit 1
+
+      - name: Output deployment info
+        run: |
+          echo "🚀 Deployment Summary:"
+          echo "  - Image: ${{ steps.build-image.outputs.image }}"
+          echo "  - Cluster: ${{ env.ECS_CLUSTER }}"
+          echo "  - Service: ${{ env.ECS_SERVICE }}"
+          echo "  - Region: ${{ env.AWS_REGION }}"

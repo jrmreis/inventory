@@ -1,0 +1,7 @@
+# Terraform variables - Copy this to terraform.tfvars and customize
+
+aws_region   = "us-east-1"
+environment  = "production"
+project_name = "inventory-bot"
+
+# Update the github-oidc.tf file with your GitHub repository name before applying
