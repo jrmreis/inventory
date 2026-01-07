@@ -138,6 +138,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /list - List all components (paginated)
 /view - View component details by ID
 
+*Container Organization:*
+/containers - List all containers
+/container_add <name> [location] - Create container
+/container_view <name> - View container contents
+/container_assign <id> <container> - Assign component
+
 *Stock Management:*
 /use - Record component usage in a project
 /adjust - Adjust component quantity
@@ -552,29 +558,80 @@ async def handle_photo_quantity(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # Check if we're waiting for quantity from photo
-    if not context.user_data.get('awaiting_quantity_for_photo'):
-        return
+    if context.user_data.get('awaiting_quantity_for_photo'):
+        text = update.message.text.strip().lower()
 
-    text = update.message.text.strip().lower()
+        # Handle skip
+        if text == 'skip':
+            await update.message.reply_text("❌ Component not saved. Cancelled.")
+            context.user_data.clear()
+            return
 
-    # Handle skip
-    if text == 'skip':
-        await update.message.reply_text("❌ Component not saved. Cancelled.")
-        context.user_data.clear()
-        return
+        # Try to parse quantity
+        try:
+            quantity = int(text)
+            if quantity < 0:
+                raise ValueError("Quantity must be positive")
 
-    # Try to parse quantity
+            # Store quantity and ask for container
+            component = context.user_data.get('component', {})
+            component['quantity'] = quantity
+            context.user_data['component'] = component
+
+            # Get list of containers
+            db = get_supabase()
+            containers = db.table('containers').select('name').execute()
+
+            if containers.data and len(containers.data) > 0:
+                container_list = "\n".join([f"• {c['name']}" for c in containers.data])
+                await update.message.reply_text(
+                    f"📦 Which container/group?\n\n"
+                    f"Available containers:\n{container_list}\n\n"
+                    f"Type container name, or 'none' to skip:"
+                )
+                # Change state to wait for container
+                context.user_data['awaiting_quantity_for_photo'] = False
+                context.user_data['awaiting_container_for_photo'] = True
+            else:
+                # No containers, save directly
+                await save_photo_component(update, context, None)
+
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Please enter a valid number for quantity, or type 'skip' to cancel."
+            )
+
+    # Check if we're waiting for container selection
+    elif context.user_data.get('awaiting_container_for_photo'):
+        container_name = update.message.text.strip()
+
+        if container_name.lower() == 'none':
+            await save_photo_component(update, context, None)
+        else:
+            # Verify container exists
+            db = get_supabase()
+            container_result = db.table('containers').select('id').eq('name', container_name).execute()
+
+            if container_result.data:
+                container_id = container_result.data[0]['id']
+                await save_photo_component(update, context, container_id)
+            else:
+                await update.message.reply_text(
+                    f"❌ Container '{container_name}' not found.\n"
+                    f"Type a valid container name or 'none' to skip."
+                )
+
+
+async def save_photo_component(update: Update, context: ContextTypes.DEFAULT_TYPE, container_id: Optional[int]) -> None:
+    """Save the component from photo recognition to database."""
     try:
-        quantity = int(text)
-        if quantity < 0:
-            raise ValueError("Quantity must be positive")
-
-        # Get component data from context
         component = context.user_data.get('component', {})
-        component['quantity'] = quantity
+
+        # Add container if provided
+        if container_id:
+            component['container_id'] = container_id
 
         # Remove fields that don't exist in database schema
-        # Vision AI adds these extra fields that we don't have columns for
         component.pop('recognition_method', None)
         component.pop('visual_features', None)
 
@@ -584,22 +641,32 @@ async def handle_photo_quantity(update: Update, context: ContextTypes.DEFAULT_TY
 
         component_id = result.data[0]['id']
         comp_name = component.get('name', 'Unknown')
+        quantity = component.get('quantity', 0)
+
+        # Get container name if assigned
+        container_msg = ""
+        if container_id:
+            container_result = db.table('containers').select('name, location').eq('id', container_id).execute()
+            if container_result.data:
+                container_name = container_result.data[0]['name']
+                location = container_result.data[0].get('location')
+                container_msg = f"📦 Container: {container_name}"
+                if location:
+                    container_msg += f" ({location})"
+                container_msg += "\n"
 
         await update.message.reply_text(
             f"✅ Component saved successfully!\n\n"
             f"📦 {comp_name}\n"
             f"🆔 ID: {component_id}\n"
-            f"📊 Quantity: {quantity}\n\n"
-            f"Use /view {component_id} to see full details or /status to see inventory."
+            f"📊 Quantity: {quantity}\n"
+            f"{container_msg}\n"
+            f"Use /view {component_id} to see full details or /containers to see your containers."
         )
 
         # Clear context
         context.user_data.clear()
 
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Please enter a valid number for quantity, or type 'skip' to cancel."
-        )
     except Exception as e:
         logger.error(f"Error saving photo component: {e}")
         await update.message.reply_text(
@@ -761,26 +828,28 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         total_components = sum(item['unique_components'] for item in summary.data)
         total_quantity = sum(item['total_quantity'] for item in summary.data)
 
-        response = f"""
-📊 *Inventory Status*
+        response = f"""📊 Inventory Status
 
-*Overall Statistics:*
+Overall Statistics:
 • Unique Components: {total_components}
 • Total Items: {total_quantity}
 • Low Stock Items: {len(low_stock.data)}
 
-*By Component Type:*
+By Component Type:
 """
 
         for item in summary.data[:10]:
-            response += f"\n• {item['component_type']}: {item['unique_components']} types, {item['total_quantity']} items"
+            comp_type = item['component_type'].replace('_', ' ').title()
+            response += f"• {comp_type}: {item['unique_components']} types, {item['total_quantity']} items\n"
 
         if low_stock.data:
-            response += "\n\n⚠️ *Low Stock Alert:*\n"
+            response += "\n⚠️ Low Stock Alert:\n"
             for comp in low_stock.data[:5]:
-                response += f"• {comp['name']}: {comp['quantity']}/{comp['minimum_quantity']}\n"
+                name = comp['name'][:30]  # Truncate long names
+                response += f"• {name}: {comp['quantity']}/{comp['minimum_quantity']}\n"
 
-        await update.message.reply_text(response, parse_mode='Markdown')
+        # Send without Markdown to avoid parsing errors
+        await update.message.reply_text(response)
 
     except Exception as e:
         logger.error(f"Status error: {e}")
@@ -829,6 +898,208 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ============ CONTAINER MANAGEMENT COMMANDS ============
+
+async def containers_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all containers."""
+    if not is_authorized(update.effective_user):
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+
+    try:
+        db = get_supabase()
+        result = db.table('v_container_inventory').select('*').execute()
+
+        if not result.data:
+            await update.message.reply_text(
+                "📦 No containers yet!\n\n"
+                "Create one with: /container_add <name> [location]"
+            )
+            return
+
+        response = "📦 *Your Containers:*\n\n"
+
+        for container in result.data:
+            name = container['name']
+            location = container.get('location') or 'No location'
+            count = container.get('actual_count', 0)
+            total_items = container.get('total_items', 0)
+
+            response += f"📦 *{name}*\n"
+            response += f"   📍 {location}\n"
+            response += f"   📊 {count} types, {total_items} items\n\n"
+
+        response += "\nUse /container_view <name> to see details"
+
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"List containers error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def container_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a new container."""
+    if not is_authorized(update.effective_user):
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+
+    try:
+        if not context.args or len(context.args) == 0:
+            await update.message.reply_text(
+                "Usage: /container_add <name> [location]\n\n"
+                "Examples:\n"
+                "  /container_add \"Box 1\"\n"
+                "  /container_add \"Arduino Parts\" \"Shelf A\""
+            )
+            return
+
+        # Extract name and optional location
+        if len(context.args) == 1:
+            name = context.args[0]
+            location = None
+        else:
+            name = context.args[0]
+            location = ' '.join(context.args[1:])
+
+        db = get_supabase()
+
+        # Create container
+        container_data = {
+            'name': name,
+            'location': location,
+            'created_by': update.effective_user.id
+        }
+
+        result = db.table('containers').insert(container_data).execute()
+
+        if result.data:
+            container_id = result.data[0]['id']
+            await update.message.reply_text(
+                f"✅ Container created!\n\n"
+                f"📦 {name}\n"
+                f"📍 {location or 'No location set'}\n"
+                f"🆔 ID: {container_id}\n\n"
+                f"Assign components with: /container_assign <component_id> \"{name}\""
+            )
+        else:
+            await update.message.reply_text("❌ Failed to create container")
+
+    except Exception as e:
+        logger.error(f"Add container error: {e}")
+        if 'duplicate' in str(e).lower():
+            await update.message.reply_text(f"❌ Container '{context.args[0]}' already exists!")
+        else:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def container_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View container details and contents."""
+    if not is_authorized(update.effective_user):
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+
+    try:
+        if not context.args or len(context.args) == 0:
+            await update.message.reply_text(
+                "Usage: /container_view <name>\n\n"
+                "Example: /container_view \"Box 1\""
+            )
+            return
+
+        name = ' '.join(context.args)
+
+        db = get_supabase()
+
+        # Get container info
+        container_result = db.table('containers').select('*').eq('name', name).execute()
+
+        if not container_result.data:
+            await update.message.reply_text(f"❌ Container '{name}' not found")
+            return
+
+        container = container_result.data[0]
+
+        # Get components in this container
+        components_result = db.table('components').select('*').eq('container_id', container['id']).execute()
+
+        response = f"📦 *{container['name']}*\n\n"
+        response += f"📍 Location: {container.get('location') or 'Not set'}\n"
+        response += f"📊 Components: {len(components_result.data)} types\n"
+
+        if container.get('description'):
+            response += f"📝 {container['description']}\n"
+
+        if components_result.data:
+            total_items = sum(c.get('quantity', 0) for c in components_result.data)
+            response += f"📈 Total items: {total_items}\n\n"
+            response += "*Contents:*\n"
+
+            for comp in components_result.data:
+                response += f"\n• {comp['name']} (ID: {comp['id']})\n"
+                response += f"  Type: {comp.get('component_type')}\n"
+                response += f"  Qty: {comp.get('quantity', 0)}\n"
+        else:
+            response += "\n_Container is empty_"
+
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"View container error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def container_assign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Assign a component to a container."""
+    if not is_authorized(update.effective_user):
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+
+    try:
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /container_assign <component_id> <container_name>\n\n"
+                "Example: /container_assign 5 \"Box 1\""
+            )
+            return
+
+        component_id = int(context.args[0])
+        container_name = ' '.join(context.args[1:])
+
+        db = get_supabase()
+
+        # Get container
+        container_result = db.table('containers').select('*').eq('name', container_name).execute()
+
+        if not container_result.data:
+            await update.message.reply_text(f"❌ Container '{container_name}' not found")
+            return
+
+        container = container_result.data[0]
+
+        # Update component
+        update_result = db.table('components').update({
+            'container_id': container['id'],
+            'last_modified_by': update.effective_user.id
+        }).eq('id', component_id).execute()
+
+        if update_result.data:
+            comp = update_result.data[0]
+            await update.message.reply_text(
+                f"✅ Component assigned!\n\n"
+                f"📦 {comp['name']} → {container_name}\n"
+                f"📍 {container.get('location') or 'No location'}"
+            )
+        else:
+            await update.message.reply_text(f"❌ Component with ID {component_id} not found")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid component ID. Must be a number.")
+    except Exception as e:
+        logger.error(f"Assign container error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
 def main():
     """Start the bot."""
     # Get bot token
@@ -861,6 +1132,13 @@ def main():
     application.add_handler(CommandHandler("search", search_components))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("low_stock", low_stock_command))
+
+    # Container management handlers
+    application.add_handler(CommandHandler("containers", containers_list))
+    application.add_handler(CommandHandler("container_add", container_add))
+    application.add_handler(CommandHandler("container_view", container_view))
+    application.add_handler(CommandHandler("container_assign", container_assign))
+
     application.add_handler(add_conv_handler)
 
     # Handler for quantity input after photo recognition (must be before photo handler)

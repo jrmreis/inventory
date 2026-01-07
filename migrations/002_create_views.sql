@@ -1,6 +1,17 @@
 -- Useful database views for the inventory system
 -- Run this in your Supabase SQL editor after running 001_create_components_table.sql
 
+-- Drop existing views first to avoid conflicts
+DROP VIEW IF EXISTS v_inventory_value_by_type;
+DROP VIEW IF EXISTS v_purchase_recommendations;
+DROP VIEW IF EXISTS v_most_used_components;
+DROP VIEW IF EXISTS v_components_detailed;
+DROP VIEW IF EXISTS v_component_usage_stats;
+DROP VIEW IF EXISTS v_recent_stock_movements;
+DROP VIEW IF EXISTS v_inventory_summary_by_location;
+DROP VIEW IF EXISTS v_inventory_summary_by_type;
+DROP VIEW IF EXISTS v_low_stock_components;
+
 -- View: Low stock components (quantity at or below minimum)
 CREATE OR REPLACE VIEW v_low_stock_components AS
 SELECT
@@ -80,10 +91,10 @@ ORDER BY total_quantity_used DESC NULLS LAST;
 CREATE OR REPLACE VIEW v_components_detailed AS
 SELECT
     c.*,
-    COALESCE(usage_stats.usage_count, 0) AS usage_count,
-    COALESCE(usage_stats.total_quantity_used, 0) AS total_quantity_used,
-    usage_stats.last_used_date,
-    usage_stats.projects_used_in,
+    COALESCE(usage_stats.usage_count, 0) AS component_usage_count,
+    COALESCE(usage_stats.total_quantity_used, 0) AS component_total_used,
+    usage_stats.last_used_date AS component_last_used,
+    usage_stats.projects_used_in AS component_projects,
     CASE
         WHEN c.quantity <= 0 THEN 'OUT_OF_STOCK'
         WHEN c.quantity <= c.minimum_quantity THEN 'LOW_STOCK'
